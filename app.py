@@ -33,363 +33,6 @@ from flask import (
 )
 from curl_cffi import requests as curl_requests
 from werkzeug.middleware.proxy_fix import ProxyFix
-from playwright.async_api import async_playwright, Browser, BrowserContext
-
-
-class PlaywrightStatsigManager:
-    """
-    x-statsig-id capture using Playwright (adapted from Grok3API driver.py)
-
-    This approach captures authentic x-statsig-id headers by:
-    1. Patching window.fetch to intercept grok.com's own API calls
-    2. Triggering a real request on grok.com to generate authentic headers
-    3. Capturing and storing the real x-statsig-id for reuse
-    """
-
-    def __init__(self, proxy_url: Optional[str] = None):
-        self._cached_statsig_id: Optional[str] = None
-        self._cache_timestamp: Optional[int] = None
-        self._cache_duration = 300
-        self._context: Optional[BrowserContext] = None
-        self._playwright = None
-        self._lock = threading.Lock()
-        self._base_url = "https://grok.com/"
-        self._proxy_url = proxy_url
-
-    def _run_async(self, coro):
-        """Run async function in thread-safe manner"""
-        try:
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                import concurrent.futures
-
-                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-                    future = executor.submit(asyncio.run, coro)
-                    return future.result(timeout=300)
-            else:
-                return loop.run_until_complete(coro)
-        except RuntimeError:
-            return asyncio.run(coro)
-
-    async def _ensure_browser(self):
-        """Ensure browser is available and ready"""
-        if not self._context:
-            self._playwright = await async_playwright().start()
-
-            context_options = {
-                "viewport": {"width": 1920, "height": 1080},
-                "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
-            }
-
-            if self._proxy_url:
-                context_options["proxy"] = {"server": self._proxy_url}
-
-            self._context = await self._playwright.chromium.launch_persistent_context(
-                user_data_dir="./data/chrome",
-                headless=True,
-                no_viewport=True,
-                channel="chrome",
-                args=[
-                    "--no-first-run",
-                    "--force-color-profile=srgb",
-                    "--metrics-recording-only",
-                    "--password-store=basic",
-                    "--no-default-browser-check",
-                    "--no-sandbox",
-                    "--disable-dev-shm-usage",
-                    "--disable-gpu",
-                    "--disable-web-security",
-                    "--disable-features=VizDisplayCompositor",
-                    "--user-agent=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
-                ],
-                **context_options,
-            )
-
-    async def check_real_ip(self) -> str:
-        """Check the real IP address using Playwright browser"""
-        try:
-            await self._ensure_browser()
-            page = await self._context.new_page()  # type: ignore
-
-            try:
-                print("Checking real IP address via ipify API")
-                await page.goto("https://api.ipify.org?format=json", timeout=30000)
-
-                content = await page.content()
-
-                ip_info = await page.evaluate(
-                    """
-                    () => {
-                        try {
-                            const bodyText = document.body.textContent || document.body.innerText;
-                            return JSON.parse(bodyText);
-                        } catch (e) {
-                            return null;
-                        }
-                    }
-                """
-                )
-
-                if ip_info and ip_info.get("ip"):
-                    ip_address = ip_info["ip"]
-                    print(f"Playwright real IP address: {ip_address}")
-                    return ip_address
-                else:
-                    print("Failed to parse IP from ipify response")
-                    return "unknown"
-
-            except Exception as e:
-                print(f"Error checking IP address: {e}")
-                return "error"
-            finally:
-                await page.close()
-
-        except Exception as e:
-            print(f"Failed to check real IP address: {e}")
-            return "failed"
-
-    async def _cleanup(self):
-        """Clean up browser resources"""
-        if self._context:
-            await self._context.close()
-            self._context = None
-        if self._playwright:
-            await self._playwright.stop()
-            self._playwright = None
-
-    def cleanup(self):
-        """Synchronous cleanup wrapper"""
-        if self._context:
-            self._run_async(self._cleanup())
-
-    async def _patch_fetch_for_statsig(self, page):
-        """Patch window.fetch to intercept x-statsig-id headers (adapted from driver.py)"""
-        result = await page.evaluate(
-            """
-            (() => {
-                if (window.__fetchPatched) {
-                    return "fetch already patched";
-                }
-
-                window.__fetchPatched = false;
-                const originalFetch = window.fetch;
-                window.__xStatsigId = null;
-
-                window.fetch = async function(...args) {
-                    console.log("Intercepted fetch call with args:", args);
-
-                    const response = await originalFetch.apply(this, args);
-
-                    try {
-                        const req = args[0];
-                        const opts = args[1] || {};
-                        const url = typeof req === 'string' ? req : req.url;
-                        const headers = opts.headers || {};
-
-                        const targetUrl = "https://grok.com/rest/app-chat/conversations/new";
-
-                        if (url === targetUrl) {
-                            let id = null;
-                            if (headers["x-statsig-id"]) {
-                                id = headers["x-statsig-id"];
-                            } else if (typeof opts.headers?.get === "function") {
-                                id = opts.headers.get("x-statsig-id");
-                            }
-
-                            if (id) {
-                                window.__xStatsigId = id;
-                                console.log("Captured x-statsig-id:", id);
-                            } else {
-                                console.warn("x-statsig-id not found in headers");
-                            }
-                        } else {
-                            console.log("Skipped fetch, URL doesn't match target:", url);
-                        }
-                    } catch (e) {
-                        console.warn("Error capturing x-statsig-id:", e);
-                    }
-
-                    return response;
-                };
-
-                window.__fetchPatched = true;
-                return "fetch successfully patched";
-            })()
-        """
-        )
-        print(f"Fetch patching result: {result}")
-
-    async def _initiate_answer(self, page):
-        """Trigger a real request to grok.com to capture x-statsig-id"""
-        try:
-
-            await page.wait_for_selector("div.relative.z-10 textarea", timeout=30000)
-
-            import random
-            import string
-
-            random_char = random.choice(string.ascii_lowercase)
-
-            await page.fill("div.relative.z-10 textarea", random_char)
-            await page.press("div.relative.z-10 textarea", "Enter")
-
-            print(f"Triggered request with character: {random_char}")
-
-        except Exception as e:
-            print(f"Error triggering answer: {e}")
-            title = await page.title()
-            url = page.url
-            print(f"Page title: {title}, URL: {url}")
-
-            raise
-
-    async def _capture_statsig_id_async(
-        self, restart_session: bool = False
-    ) -> Optional[str]:
-        """Capture x-statsig-id from real grok.com interaction"""
-        try:
-            await self._ensure_browser()
-            page = await self._context.new_page()  # type: ignore
-
-            try:
-
-                print("Navigating to grok.com")
-                await page.goto(
-                    self._base_url, wait_until="domcontentloaded", timeout=30000
-                )
-
-                await self._patch_fetch_for_statsig(page)
-
-                captcha_visible = await page.evaluate(
-                    """
-                    (() => {
-                        const elements = document.querySelectorAll("p");
-                        for (const el of elements) {
-                            if (el.textContent.includes("Making sure you're human")) {
-                                const style = window.getComputedStyle(el);
-                                if (style.visibility !== 'hidden' && style.display !== 'none') {
-                                    return true;
-                                }
-                            }
-                        }
-                        return false;
-                    })()
-                """
-                )
-
-                if captcha_visible:
-                    print("Captcha detected, cannot capture x-statsig-id")
-                    return None
-
-                await self._initiate_answer(page)
-
-                try:
-                    await page.locator("div.message-bubble p[dir='auto']").or_(
-                        page.locator("div.w-full.max-w-\\[48rem\\]")
-                    ).or_(
-                        page.locator("p", has_text="Making sure you're human")
-                    ).wait_for(
-                        timeout=20000
-                    )
-                except:
-                    print("No response elements found within timeout")
-
-                error_elements = await page.query_selector_all(
-                    "div.w-full.max-w-\\[48rem\\]"
-                )
-                if error_elements:
-                    print("Authentication error detected")
-                    return None
-
-                captcha_elements = await page.query_selector_all(
-                    "p:has-text('Making sure you\\'re human')"
-                )
-                if captcha_elements:
-                    print("Captcha appeared during request")
-                    return None
-
-                statsig_id = await page.evaluate("window.__xStatsigId")
-
-                if statsig_id:
-                    print(f"Successfully captured x-statsig-id: {statsig_id[:30]}...")
-                    return statsig_id
-                else:
-                    print("No x-statsig-id was captured")
-                    return None
-
-            finally:
-                await page.close()
-
-        except Exception as e:
-            print(f"Error capturing x-statsig-id: {e}")
-            return None
-
-    def capture_statsig_id(self, restart_session: bool = False) -> Optional[str]:
-        """Capture x-statsig-id (sync wrapper)"""
-        with self._lock:
-            return self._run_async(self._capture_statsig_id_async(restart_session))
-
-    def check_real_ip_sync(self) -> str:
-        """Check real IP address (sync wrapper)"""
-        with self._lock:
-            return self._run_async(self.check_real_ip())
-
-    def generate_xai_request_id(self) -> str:
-        """Generate x-xai-request-id (simple UUID)"""
-        return str(uuid.uuid4())
-
-    def get_dynamic_headers(
-        self, method: str = "POST", pathname: str = "/rest/app-chat/conversations/new"
-    ) -> Dict[str, str]:
-        """Get dynamic headers including captured x-statsig-id and x-xai-request-id"""
-        headers = {}
-        current_time = int(time.time())
-
-        with self._lock:
-            if (
-                self._cached_statsig_id
-                and self._cache_timestamp
-                and (current_time - self._cache_timestamp) < self._cache_duration
-            ):
-                print("Using cached x-statsig-id")
-                headers["x-statsig-id"] = self._cached_statsig_id
-
-        if "x-statsig-id" not in headers:
-            print("Capturing fresh x-statsig-id")
-            statsig_id = self.capture_statsig_id()
-            if statsig_id:
-                with self._lock:
-                    self._cached_statsig_id = statsig_id
-                    self._cache_timestamp = current_time
-                    headers["x-statsig-id"] = statsig_id
-            else:
-                print("Failed to capture x-statsig-id, using fallback")
-                headers["x-statsig-id"] = (
-                    "ZTpUeXBlRXJyb3I6IENhbm5vdCByZWFkIHByb3BlcnRpZXMgb2YgdW5kZWZpbmVkIChyZWFkaW5nICdjaGlsZE5vZGVzJyk="
-                )
-
-        headers["x-xai-request-id"] = self.generate_xai_request_id()
-
-        print(f"Generated dynamic headers: {list(headers.keys())}")
-        return headers
-
-
-_global_statsig_manager: Optional[PlaywrightStatsigManager] = None
-
-
-def initialize_statsig_manager(proxy_url: Optional[str] = None) -> None:
-    """Initialize the global StatsigManager instance with configuration"""
-    global _global_statsig_manager
-    if _global_statsig_manager is None:
-        _global_statsig_manager = PlaywrightStatsigManager(proxy_url=proxy_url)
-
-
-def get_statsig_manager() -> PlaywrightStatsigManager:
-    """Get or create the global StatsigManager instance"""
-    global _global_statsig_manager
-    if _global_statsig_manager is None:
-        _global_statsig_manager = PlaywrightStatsigManager()
-    return _global_statsig_manager
 
 
 class ModelType(Enum):
@@ -452,46 +95,13 @@ def get_dynamic_headers(
     pathname: str = "/rest/app-chat/conversations/new",
     config: Optional["ConfigurationManager"] = None,
 ) -> Dict[str, str]:
-    """
-    Get headers with dynamic x-statsig-id and x-xai-request-id or fallback headers
+    headers = BASE_HEADERS.copy()
 
-    Args:
-        method: HTTP method for the request
-        pathname: Request pathname for statsig generation
-        config: Configuration manager to check if dynamic headers are disabled
-
-    Returns:
-        Dictionary with all headers including dynamic ones or fallback
-    """
-    try:
-        headers = BASE_HEADERS.copy()
-
-        if config and config.get("API.DISABLE_DYNAMIC_HEADERS", False):
-            print("Dynamic headers disabled, using fallback headers")
-            headers["x-xai-request-id"] = str(uuid.uuid4())
-            headers["x-statsig-id"] = (
-                "ZTpUeXBlRXJyb3I6IENhbm5vdCByZWFkIHByb3BlcnRpZXMgb2YgdW5kZWZpbmVkIChyZWFkaW5nICdjaGlsZE5vZGVzJyk="
-            )
-            return headers
-
-        statsig_manager = get_statsig_manager()
-        dynamic_headers = statsig_manager.get_dynamic_headers(method, pathname)
-
-        headers.update(dynamic_headers)
-
-        print(f"Generated dynamic headers for {method} {pathname}")
-        return headers
-
-    except Exception as e:
-        print(f"Error generating dynamic headers: {e}")
-
-        headers = BASE_HEADERS.copy()
-        headers["x-xai-request-id"] = str(uuid.uuid4())
-
-        headers["x-statsig-id"] = (
-            "ZTpUeXBlRXJyb3I6IENhbm5vdCByZWFkIHByb3BlcnRpZXMgb2YgdW5kZWZpbmVkIChyZWFkaW5nICdjaGlsZE5vZGVzJyk="
-        )
-        return headers
+    headers["x-xai-request-id"] = str(uuid.uuid4())
+    headers["x-statsig-id"] = (
+        "ZTpUeXBlRXJyb3I6IENhbm5vdCByZWFkIHByb3BlcnRpZXMgb2YgdW5kZWZpbmVkIChyZWFkaW5nICdjaGlsZE5vZGVzJyk="
+    )
+    return headers
 
 
 class GrokApiException(Exception):
@@ -1481,7 +1091,9 @@ class ThreadSafeTokenManager:
                             "last_failure_reason": None,
                         }
                         migration_count += 1
-                        print(f"Added missing {model_name} data for token {sso_value[:20]}...")
+                        print(
+                            f"Added missing {model_name} data for token {sso_value[:20]}..."
+                        )
 
                 for model, model_data in models_data.items():
                     is_super = model_data.get("isSuper", False)
@@ -1523,7 +1135,9 @@ class ThreadSafeTokenManager:
                 print(f"Reconstructed {reconstructed_count} token entries")
 
             if migration_count > 0:
-                print(f"Added missing model data to {migration_count} token-model combinations for backward compatibility")
+                print(
+                    f"Added missing model data to {migration_count} token-model combinations for backward compatibility"
+                )
                 self._save_token_status()
 
         except Exception as e:
@@ -4246,39 +3860,14 @@ def initialize_application(
                 "Initialization",
             )
 
-    proxy_url = config.get("API.PROXY")
-
-    if not config.get("API.DISABLE_DYNAMIC_HEADERS", False):
-        initialize_statsig_manager(proxy_url=proxy_url)
-        if proxy_url:
-            print(f"StatsigManager initialized with proxy: {proxy_url}")
-        else:
-            print("StatsigManager initialized without proxy")
-
-        try:
-            statsig_manager = get_statsig_manager()
-            real_ip = statsig_manager.check_real_ip_sync()
-            if real_ip and real_ip not in ["error", "failed", "unknown"]:
-                print(f"Playwright real IP address: {real_ip}")
-            else:
-                print(f"Failed to get real IP address: {real_ip}")
-        except Exception as e:
-            print(f"Error checking real IP address: {e}")
-    else:
-        print("Dynamic headers disabled - skipping StatsigManager initialization")
+    print("Dynamic headers disabled - skipping StatsigManager initialization")
 
     print("Application initialization completed")
 
 
 def cleanup_resources():
     """Clean up browser resources before shutdown"""
-    global _global_statsig_manager
-    if _global_statsig_manager:
-        try:
-            _global_statsig_manager.cleanup()
-            print("Browser resources cleaned up successfully")
-        except Exception as e:
-            print(f"Error cleaning up browser resources: {e}")
+    pass
 
 
 def main():
